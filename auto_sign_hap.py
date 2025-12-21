@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+"""
+Auto-sign an unsigned HarmonyOS/OpenHarmony `.hap` using DevEco Studio materials.
+
+This script mirrors the core DevEco/hvigor signing flow:
+1) Read `build-profile.json5` -> `app.signingConfigs[*].material`.
+2) Decrypt encrypted passwords (storePassword/keyPassword) using local `.ohos/config/material`.
+3) Call DevEco's `hap-sign-tool.jar sign-app -mode localSign` to generate a signed HAP.
+
+Notes:
+- The signing profile (.p7b) bundleName should match the target HAP bundleName.
+- Secrets: decrypted passwords are passed to the Java signer process; avoid running in untrusted environments.
+"""
+
 import argparse
 import json
 import os
@@ -12,10 +25,16 @@ from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+# This 16-byte constant comes from hvigor-ohos-plugin's DecipherUtil.component and
+# participates in deriving the AES-GCM key used to decrypt DevEco's stored passwords.
 COMPONENT = bytes([49, 243, 9, 115, 214, 175, 91, 184, 211, 190, 177, 88, 101, 131, 192, 119])
 
 
 def strip_json5(text: str) -> str:
+    # Minimal JSON5 -> JSON normalization:
+    # - remove // and /* */ comments
+    # - remove trailing commas
+    # - keep string literals intact (don't strip comment markers inside strings)
     out = []
     in_str = None
     escape = False
@@ -62,6 +81,7 @@ def load_json5(path: Path) -> dict:
 
 
 def resolve_path(path_str: str, base_dir: Path) -> Path:
+    # build-profile.json5 often uses absolute paths, but allow relative paths too.
     p = Path(path_str)
     return p if p.is_absolute() else (base_dir / p).resolve()
 
@@ -83,6 +103,7 @@ def find_bundle_name_from_obj(obj):
 
 
 def get_bundle_name_from_hap(hap_path: Path) -> str:
+    # We only need bundleName; parse the first reasonable config file inside the HAP.
     with zipfile.ZipFile(hap_path, "r") as zf:
         names = zf.namelist()
         candidates = [
@@ -102,6 +123,7 @@ def get_bundle_name_from_hap(hap_path: Path) -> str:
 
 
 def _read_single_file_bytes(dir_path: Path) -> bytes:
+    # The material directories (fd/ac/ce) are expected to contain exactly one file each.
     files = [p for p in dir_path.iterdir() if p.name != ".DS_Store" and p.is_file()]
     if len(files) != 1:
         raise SystemExit(f"Expected exactly 1 file in {dir_path}, found {len(files)}.")
@@ -109,6 +131,8 @@ def _read_single_file_bytes(dir_path: Path) -> bytes:
 
 
 def _decrypt(key: bytes, data: bytes) -> bytes:
+    # Data format matches hvigor-ohos-plugin DecipherUtil:
+    # [0..3] big-endian int r, then IV bytes, then ciphertext, then 16-byte GCM tag.
     if len(data) < 4 + 16:
         raise SystemExit("Encrypted material is too short.")
     r = (data[0] << 24) | (data[1] << 16) | (data[2] << 8) | data[3]
@@ -150,19 +174,22 @@ def _get_key(material_root: Path) -> bytes:
         for i in range(16):
             xor_bytes[i] ^= comp[i]
 
-    # Node's Buffer.toString() uses UTF-8 with replacement for invalid bytes.
+    # hvigor uses Node's Buffer.toString() on the XOR result before PBKDF2,
+    # which is UTF-8 with replacement for invalid bytes.
     pwd_str = bytes(xor_bytes).decode("utf-8", errors="replace")
     root_key = pbkdf2_hmac("sha256", pwd_str.encode("utf-8"), salt, 10000, dklen=16)
     return _decrypt(root_key, work)
 
 
 def decrypt_pwd(material_root: Path, encrypted_hex: str) -> str:
+    # Decrypt the encrypted hex string stored in build-profile.json5.
     key = _get_key(material_root)
     data = bytes.fromhex(encrypted_hex)
     return _decrypt(key, data).decode("utf-8")
 
 
 def find_deveco_home(explicit: str | None) -> Path | None:
+    # Best-effort DevEco installation discovery. You can always override with --deveco-home.
     if explicit:
         p = Path(explicit)
         return p if p.exists() else None
@@ -184,6 +211,7 @@ def find_deveco_home(explicit: str | None) -> Path | None:
 
 
 def find_java(deveco_home: Path | None, explicit: str | None) -> str:
+    # Prefer DevEco-bundled JBR, fallback to system java in PATH.
     if explicit:
         return explicit
     if deveco_home:
@@ -208,6 +236,7 @@ def find_sign_tool(deveco_home: Path | None, explicit: str | None) -> Path:
 
 
 def get_bundle_name_from_p7b(java: str, sign_tool: Path, p7b_path: Path) -> str:
+    # Ask hap-sign-tool to parse/verify profile and emit bundle-name as JSON.
     with tempfile.TemporaryDirectory() as tmpdir:
         out_json = Path(tmpdir) / "signConfigCheckJson.json"
         cmd = [
@@ -258,6 +287,7 @@ def has_signing_configs(profile: dict) -> bool:
 
 
 def find_parent_app_build_profile(start: Path) -> Path | None:
+    # Allow passing module-level build-profile.json5; walk upward to find the app-level one.
     cur = start.resolve()
     while True:
         candidate = cur / "build-profile.json5"
@@ -274,6 +304,7 @@ def find_parent_app_build_profile(start: Path) -> Path | None:
 
 
 def build_sign_command(java: str, sign_tool: Path, material: dict, hap_path: Path, out_path: Path) -> list[str]:
+    # CLI matches `hap-sign-tool.jar -h` for recent DevEco versions.
     cmd = [
         java,
         "-jar",
@@ -331,6 +362,7 @@ def main() -> int:
 
     profile = load_json5(profile_path)
     if not has_signing_configs(profile):
+        # Most projects keep signingConfigs at the root build-profile.json5, not in entry/build-profile.json5.
         parent_profile = find_parent_app_build_profile(profile_path.parent)
         if parent_profile and parent_profile != profile_path:
             print(

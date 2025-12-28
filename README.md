@@ -4,6 +4,10 @@
 
 > 前提：你需要一套与该 HAP `bundleName` 匹配的签名材料（`.p7b/.p12/.cer`）。没有匹配的 profile，强行签名也大概率无法安装/运行。
 
+## 示意图
+
+![Auto Sign HAP 本地签名流程示意](./autosign-flow.png)
+
 ## 原理
 
 该脚本按 DevEco Studio / hvigor 的逻辑做了三件事：
